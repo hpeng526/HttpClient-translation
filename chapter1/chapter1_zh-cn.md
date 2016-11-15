@@ -491,8 +491,110 @@ for (int i = 0; i < 10; i++) {
 
 #### 1.5 异常处理
 
+HTTP 协议处理器可以抛出两种类型的异常：`java.io.IOException` I/O失败，像 socket 超时或者 socket 被重置；`HttpException` 标志着 HTTP 失败像违反 HTTP 协议。一般来说 I/O 错误是被认为非致命性的和可恢复的，而 HTTP 协议错误这被认为致命性的和不可自动恢复的。请记住，HttpClient 将 HttpException 实现成了可抛出的类 `ClientProtocolException`，它是`java.io.IOException`的子类。这样用户就能在一个catch代码块中同时处理 I/O 错误和违反协议错误了。
+
+##### 1.5.1 HTTP 传输安全
+
+很重要的一点，HTTP 协议并不适用与所有类型的应用程序。HTTP 是一个简单的面向请求响应的协议，最初被设计成支持静态的或者动态生成内容的检索。它未被打算支持事物操作。例如，HTTP 服务认为接收和处理请求，生成响应并发送状态码回客户端就完成了约定的内容。如果客户端不能接收响应因为超市，请求取消了，或者系统崩溃了，服务器不会回滚事务。如果客户端打算重发相同的请求，服务端将会不可避免的多次执行相同的事务。某些情况下这回导致应用数据出错或者不一致的应用状态。
+尽管 HTTP 从未被设计成支持事务，它仍可以被用作在特定条件下满足关键任务应用的传输协议。为了保证 HTTP 传输层的安全性，系统必须保证应用层中的 HTTP 方法是幂等的。
 
 
+##### 1.5.2 幂等方法。
+
+HTTP/1.1 规范定义了幂等方法
+【 N > 0 次的相同多次请求等同与单次请求的效果（除了错误或者过期问题），这样的方法具有幂等性】。
+换句话说应用程序必须保证处理可能是多种请求的但是相同含义的方法情况。例如，通过提供一个独特的事务id和通过避免相同逻辑操作的执行来实现。请注意，这个问题不局限于 HttpClient，基于浏览器的应用程序都会面临同样的问题因为 HTTP 方法的非幂等性。
+默认情况下 HttpClient 假定唯一的非实体方法，如 GET 和 HEAD 是幂等的实体方法，POST 和 PUT 为了兼容则不是幂等的。
+
+##### 1.5.3 自动恢复异常
+
+默认情况下 HttpClient 回尝试从 I/O 异常中自动恢复，默认的自动恢复机智只限于少数已知的安全的异常。
+* HttpClient 不会尝试从任何逻辑上或者 HTTP 协议错误中恢复（派生于`HttpException`类）
+* HttpClient 会自动重试那些被认为是幂等的方法。
+* HttpClient 会自动重试 HTTP 请求正在传输到目标服务器由于传输异常导致失败的异常。（就是请求没有完全被传输到服务器）
+
+##### 1.5.4 请求重试处理
+
+为了确保自定义异常恢复机制，必须为`HttpRequestRetryHandler`接口提供一个实现。
+
+```java
+HttpRequestRetryHandler myRetryHandler = new HttpRequestRetryHandler() {
+
+    public boolean retryRequest(
+            IOException exception,
+            int executionCount,
+            HttpContext context) {
+        if (executionCount >= 5) {
+            // Do not retry if over max retry count
+            return false;
+        }
+        if (exception instanceof InterruptedIOException) {
+            // Timeout
+            return false;
+        }
+        if (exception instanceof UnknownHostException) {
+            // Unknown host
+            return false;
+        }
+        if (exception instanceof ConnectTimeoutException) {
+            // Connection refused
+            return false;
+        }
+        if (exception instanceof SSLException) {
+            // SSL handshake exception
+            return false;
+        }
+        HttpClientContext clientContext = HttpClientContext.adapt(context);
+        HttpRequest request = clientContext.getRequest();
+        boolean idempotent = !(request instanceof HttpEntityEnclosingRequest);
+        if (idempotent) {
+            // Retry if the request is considered idempotent
+            return true;
+        }
+        return false;
+    }
+
+};
+CloseableHttpClient httpclient = HttpClients.custom()
+        .setRetryHandler(myRetryHandler)
+        .build();
+```
+
+请注意，可以用StandardHttpRequestRetryHandler代替使用默认的，为了处理安全自动的重试那些在 RFC-2616 协议中定义的请求方法GET，HEAD，PUT，DELETE，OPTIONS 和 TRACE。
+
+#### 1.6 中断请求
+
+某些情况下，HTTP 请求围在预期时间框架内完成，因为目标服务器的高负载或者客户端有太多并发的请求。在这种情况下，可能需要提前中止请求，并开启阻塞在 I/O 操作的线程。通过`HttpUriRequest#abort()`方法可以在任何阶段中止由 HttpClient 执行的 HTTP 请求。这个方法是线程安全的，可以在任意线程调用。当一个 HTTP 请求被中断他的执行线程，即使在一个 I/O 操作中阻塞，也可以通过抛出`InterruptedIOException`保持畅通。
+
+#### 1.7 重定向处理
+
+HttpClient 会自动处理所有类型的重定向，除了那些被 HTTP 规范明确禁止的需要用户干预的。
+考虑到其他的在 HTTP 规范中定义的 POST 和 PUT 请求的重定向成 GET 请求的重定向（状态码303），可以使用自定义的重定向策略来减少 HTTP 规范规定的 POST 方法重定向的限制。
+
+```java
+LaxRedirectStrategy redirectStrategy = new LaxRedirectStrategy();
+CloseableHttpClient httpclient = HttpClients.custom()
+        .setRedirectStrategy(redirectStrategy)
+        .build();
+```
+
+HttpClient 通常需要重写请求消息在执行过程中。默认的，HTTP/1.0 和 HTTP/1.1 通常使用相对的URI。同样的，原始请求可能被重定向到其他地址多次。最终解释的绝对 HTTP 地址可以用初始请求和上下文来构建。实用方法`URIUtil#resolve`可以被用来构建生成最终请求的解释绝对URI。该方法包括从重定向请求或者原始请求的最后一个片段标识符。
+
+```java
+CloseableHttpClient httpclient = HttpClients.createDefault();
+HttpClientContext context = HttpClientContext.create();
+HttpGet httpget = new HttpGet("http://localhost:8080/");
+CloseableHttpResponse response = httpclient.execute(httpget, context);
+try {
+    HttpHost target = context.getTargetHost();
+    List<URI> redirectLocations = context.getRedirectLocations();
+    URI location = URIUtils.resolve(httpget.getURI(), target, redirectLocations);
+    System.out.println("Final HTTP location: " + location.toASCIIString());
+    // Expected to be an absolute URI
+} finally {
+    response.close();
+}
+```
 
 
 

@@ -7,4 +7,5 @@ HttpClient 4.5.x translation
 
 ## 进度
 
-0. [第一章](chapter1/chapter1_zh-cn.md) ing
+0. [第一章](chapter1/chapter1_zh-cn.md)
+0. [第二章](chapter2/chapter2_zh-cn.md) ing...
