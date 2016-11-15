@@ -359,11 +359,137 @@ ResponseHandler<MyJsonObject> rh = new ResponseHandler<MyJsonObject>() {
 MyJsonObject myjson = client.execute(httpget, rh);
 ```
 
-##### 1.2 HttpClient 接口
+#### 1.2 HttpClient 接口
 
+HttpClient 接口代表了 HTTP 请求执行的最重要的约定。它在请求执行中没有强加约束或特定的细节，让具体的连接管理，状态管理，认证和重定向留给各自的实现中。这会使得更容易的用额外的方法装饰接口，例如响应内容的缓存。
+通常来说 HttpClient 的实现只是作为一个门面，负责特定方面的 HTTP 协议，例如重定向，身份认证，对连接保持和连接存活长短做抉择。这使得用户可以选择性的用自定义的，应用相关的来替换默认的实现。
 
+```java
+ConnectionKeepAliveStrategy keepAliveStrat = new DefaultConnectionKeepAliveStrategy() {
 
+    @Override
+    public long getKeepAliveDuration(
+            HttpResponse response,
+            HttpContext context) {
+        long keepAlive = super.getKeepAliveDuration(response, context);
+        if (keepAlive == -1) {
+            // Keep connections alive 5 seconds if a keep-alive value
+            // has not be explicitly set by the server
+            keepAlive = 5000;
+        }
+        return keepAlive;
+    }
 
+};
+CloseableHttpClient httpclient = HttpClients.custom()
+        .setKeepAliveStrategy(keepAliveStrat)
+        .build();
+```
+
+##### 1.2.1 HttpClient 的线程安全
+
+HttpClient 的实现是线程安全的。建议同一个实例可以用于多个请求的执行。
+
+##### 1.2.2 HttpClient 资源的重新分配
+
+当一个`CloseableHttpClient`的实例已经不在需要，和即将超过连接管理关联的范围时，必须使用`CloseableHttpClient#close()`方法来关闭它。
+
+```java
+CloseableHttpClient httpclient = HttpClients.createDefault();
+try {
+    <...>
+} finally {
+    httpclient.close();
+}
+```
+
+#### 1.3 HTTP 执行上下文
+
+HTTP 起初被设计为无状态的，面向请求-响应的协议。但是实际上，应用通常要保持状态信息在逻辑相关的请求响应过程中。为了使应用保持一个处理状态，HttpClient允许在一个特定的执行上下文中执行 HTTP 请求，这叫 HTTP 上下文（HTTP context）。多个逻辑相关的请求可以在一个逻辑会话中参与，如果同一个context在连续的HTTP请求中被重复使用。Http 上下文的功能有点像 `java.uitl.Map<String, Object>`。它是简单的任意值的集合。一个应用程序可以在请求前填充上下文，或者在执行完成后检查上下文。
+HttpContext可以包含任意的对象，因此它在线程共享时是不安全的。建议每一个线程在执行时保持自己的上下文。
+在 HTTP 请求的过程中，HttpClient会添加下列属性到执行上下文里：
+* HttpConnetion 表示到目标服务器的实际连接。
+* HttpHost 表示连接目标
+* HttpRoute 表示完整的连接路由
+* HttpRequest 表示实际的 HTTP 请求。在执行上下文中最后的 HttpRequest对象始终表示消息状态，它才是被发往目标服务器的对象。每一个默认的 HTTP/1.0 HTTP/1.1 使用相对的请求 URI，但是如果请求是通过代理或者非隧道模式模式，则 URI 是绝对的。
+* java.lang.Boolean 对象表示实际是否已经完全传输到连接目标的标志。
+* RequestConfig 对象表示实际请求的配置。
+* java.util.List<URI> 对象，表示所有重定向请求执行过程中的地址集合。
+可以使用`HttpClientContext`适配器类来简化与上下文状态的交互。
+
+```java
+HttpContext context = <...>
+HttpClientContext clientContext = HttpClientContext.adapt(context);
+HttpHost target = clientContext.getTargetHost();
+HttpRequest request = clientContext.getRequest();
+HttpResponse response = clientContext.getResponse();
+RequestConfig config = clientContext.getRequestConfig();
+```
+
+在逻辑相关的绘画中多个顺序的请求应该在同一个 HttpContext 实例中来确保在请求间自动保持的会话上下文传播和状态信息。
+下面的例子中，在初始请求中的请求配置将会在执行上下文中保持，并传播到连续请求中共享相同的上下文。
+
+```java
+CloseableHttpClient httpclient = HttpClients.createDefault();
+RequestConfig requestConfig = RequestConfig.custom()
+        .setSocketTimeout(1000)
+        .setConnectTimeout(1000)
+        .build();
+
+HttpGet httpget1 = new HttpGet("http://localhost/1");
+httpget1.setConfig(requestConfig);
+CloseableHttpResponse response1 = httpclient.execute(httpget1, context);
+try {
+    HttpEntity entity1 = response1.getEntity();
+} finally {
+    response1.close();
+}
+HttpGet httpget2 = new HttpGet("http://localhost/2");
+CloseableHttpResponse response2 = httpclient.execute(httpget2, context);
+try {
+    HttpEntity entity2 = response2.getEntity();
+} finally {
+    response2.close();
+}
+```
+
+#### 1.4 HTTP 协议拦截器
+
+HTTP 协议拦截器是一个实现来 HTTP 协议特定方面的程序。通常协议拦截器是工作在在一个特定的头或者一组特定的头在进来的消息中，或者位于在出去的消息中的一个特定头或者一组特定头。协议拦截器还可以操作附带信息的内容实体，内容的压缩解压就是一个很好的例子。通常这是使用装饰模式来完成，利用装饰实体类被用于装饰原始的实体。几个协议拦截器可以组合起来形成一个逻辑单元。
+协议拦截器可以通过像通过 HTTP 执行上下文处理状态来共享信息合作。协议拦截器可以使用 HTTP 上下文为一个或者多个连续的请求来存储处理状态。
+通常拦截器的执行顺序是没关系的，只要它们不依赖特效的执行上下文状态。如果协议拦截器有内部依赖，因此必须在一种特定的顺序中执行，它们将会以一个期望的顺序被加在一个协议处理器中。
+协议拦截器必须是线程安全的。跟 servlet 类似，协议拦截器不应该使用实例除非获取这些变量需要同步的方式。
+这是一个如果本地上下文在多个连续请求中被用于保持处理状态的例子
+```java
+CloseableHttpClient httpclient = HttpClients.custom()
+        .addInterceptorLast(new HttpRequestInterceptor() {
+
+            public void process(
+                    final HttpRequest request,
+                    final HttpContext context) throws HttpException, IOException {
+                AtomicInteger count = (AtomicInteger) context.getAttribute("count");
+                request.addHeader("Count", Integer.toString(count.getAndIncrement()));
+            }
+
+        })
+        .build();
+
+AtomicInteger count = new AtomicInteger(1);
+HttpClientContext localContext = HttpClientContext.create();
+localContext.setAttribute("count", count);
+
+HttpGet httpget = new HttpGet("http://localhost/");
+for (int i = 0; i < 10; i++) {
+    CloseableHttpResponse response = httpclient.execute(httpget, localContext);
+    try {
+        HttpEntity entity = response.getEntity();
+    } finally {
+        response.close();
+    }
+}
+```
+
+#### 1.5 异常处理
 
 
 
